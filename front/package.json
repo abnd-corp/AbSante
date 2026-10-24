@@ -19,7 +19,7 @@
     "d3-scale": "^4.0.2",
     "d3-scale-chromatic": "^3.1.0",
     "leaflet": "^1.9.4",
-    "pinia": "^3.0.4",
+    "pinia": "^4.1.0",
     "vue": "^3.5.39",
     "vue-router": "^5.1.0"
   },
