@@ -18,6 +18,8 @@ function makeLayer() {
     setLatLng: vi.fn(),
     getLatLng: vi.fn(() => ({ lat: 45.0, lng: 2.0 })),
     addTo: vi.fn(),
+    bindTooltip: vi.fn(),
+    bringToFront: vi.fn(),
     __handlers: handlers,
   }
 }
@@ -33,7 +35,10 @@ const { removeSpy, mapOnSpy, fitBoundsSpy, setViewSpy } = vi.hoisted(() => ({
 let geoJsonOnEachFeature: ((feature: unknown, layer: ReturnType<typeof makeLayer>) => void) | undefined
 let geoJsonSetStyleCalls = 0
 let pointsAdded: unknown[] = []
+let nearbyAdded: unknown[] = []
+let layerGroupCalls = 0
 let controlOnAddCalled = false
+let domClickHandlers = new Map<HTMLElement, (event: Event) => void>()
 
 vi.mock('leaflet', () => {
   const geoJsonLayer = {
@@ -61,10 +66,13 @@ vi.mock('leaflet', () => {
   const map = {
     on: mapOnSpy,
     getZoom: vi.fn(() => 6),
+    getCenter: vi.fn(() => ({ lat: 46.6, lng: 2.4 })),
     setView: setViewSpy,
     fitBounds: fitBoundsSpy,
     remove: removeSpy,
     removeLayer: vi.fn(),
+    hasLayer: vi.fn(() => true),
+    createPane: vi.fn(() => document.createElement('div')),
     zoomControl: { setPosition: vi.fn() },
   }
 
@@ -84,7 +92,23 @@ vi.mock('leaflet', () => {
         geoJsonOnEachFeature = options.onEachFeature
         return geoJsonLayer
       }),
-      layerGroup: vi.fn(() => layerGroup),
+      // 1er appel = calque des établissements (`layerGroup` ci-dessus) ; 2e = calque « autour de moi »,
+      // suivi à part pour ne pas mélanger ses marqueurs avec ceux des établissements.
+      layerGroup: vi.fn(() => {
+        layerGroupCalls += 1
+        if (layerGroupCalls === 1) return layerGroup
+        return {
+          addTo: vi.fn(function (this: unknown) {
+            return this
+          }),
+          clearLayers: vi.fn(() => {
+            nearbyAdded = []
+          }),
+          addLayer: vi.fn((l: unknown) => {
+            nearbyAdded.push(l)
+          }),
+        }
+      }),
       circleMarker: vi.fn(() => makeLayer()),
       Control: Object.assign(ControlBase, {
         extend: (opts: Record<string, unknown>) => class extends ControlBase {
@@ -93,18 +117,37 @@ vi.mock('leaflet', () => {
           }
         },
       }),
+      canvas: vi.fn(() => ({})),
+      circle: vi.fn(() => makeLayer()),
       DomUtil: {
-        create: vi.fn(() => document.createElement('button')),
+        create: vi.fn((tag: string, className?: string, container?: HTMLElement) => {
+          const el = document.createElement(tag)
+          if (className) el.className = className
+          container?.appendChild(el)
+          return el
+        }),
       },
       DomEvent: {
         disableClickPropagation: vi.fn(),
-        on: vi.fn(),
+        on: vi.fn((el: HTMLElement, event: string, handler: (event: Event) => void) => {
+          if (event === 'click') domClickHandlers.set(el, handler)
+        }),
       },
     },
   }
 })
 
 import LeafletFranceMap from './LeafletFranceMap.vue'
+
+/** Clique un bouton du contrôle de navigation (sous le zoom), retrouvé par son libellé. */
+function clickNav(titleStart: string) {
+  const button = [...domClickHandlers.keys()].find((el) => el.getAttribute('title')?.startsWith(titleStart))
+  expect(button, `bouton « ${titleStart}… »`).toBeDefined()
+  domClickHandlers.get(button!)!({ preventDefault: () => {} } as Event)
+}
+function navButton(titleStart: string): HTMLElement {
+  return [...domClickHandlers.keys()].find((el) => el.getAttribute('title')?.startsWith(titleStart))!
+}
 
 const GEOJSON = {
   type: 'FeatureCollection',
@@ -135,24 +178,35 @@ const ETABLISSEMENTS_01 = {
         'CH Grandville',
         [45.531, 4.276],
         [
-          ['Dupont', 'Jean', 'Médecin'],
-          ['Martin', 'Claire', 'Infirmier'],
+          ['Dupont', 'Jean', 'Médecin', '810000000101'],
+          ['Martin', 'Claire', 'Infirmier', '810000000102'],
         ],
       ],
-      ['Cabinet Poulteau', null, [['Poulteau', 'Sylvain', 'Médecin']]],
+      ['Cabinet Poulteau', null, [['Poulteau', 'Sylvain', 'Médecin', '810000000103']]],
     ],
   },
 }
 
+// Avec spécialités et population : 1 médecin cardiologue (indice 0) à Testville, 100 000 habitants dans l'Ain.
+const DEPT_PAYLOAD_SPECIALITES = {
+  ...DEPT_PAYLOAD,
+  specialites: [['Médecin', 'Cardiologie']],
+  bySpecialite: { '01': { '0': 2 } },
+}
+const POPULATION_PAYLOAD = { byDepartement: { '01': 100000 } }
+
 function stubFetch(
   communePayload: unknown = COMMUNE_PAYLOAD,
   etablissementsPayload: unknown = ETABLISSEMENTS_01,
+  deptPayload: unknown = DEPT_PAYLOAD,
 ) {
   vi.stubGlobal(
     'fetch',
     vi.fn((url: string) => {
       if (url.includes('departements.geojson')) return Promise.resolve({ json: () => Promise.resolve(GEOJSON) })
-      if (url.includes('rpps-departement.json')) return Promise.resolve({ json: () => Promise.resolve(DEPT_PAYLOAD) })
+      if (url.includes('rpps-departement.json')) return Promise.resolve({ json: () => Promise.resolve(deptPayload) })
+      if (url.includes('population-departement.json')) return Promise.resolve({ json: () => Promise.resolve(POPULATION_PAYLOAD) })
+      if (url.includes('rpps-commune-specialite.json')) return Promise.resolve({ json: () => Promise.resolve({ communes: { '01001': [[0, 2]] } }) })
       if (url.includes('rpps-commune.json')) return Promise.resolve({ json: () => Promise.resolve(communePayload) })
       if (url.includes('/etablissements/01.json'))
         return Promise.resolve({ json: () => Promise.resolve(etablissementsPayload) })
@@ -164,7 +218,10 @@ function stubFetch(
 beforeEach(() => {
   vi.clearAllMocks()
   pointsAdded = []
+  nearbyAdded = []
+  layerGroupCalls = 0
   controlOnAddCalled = false
+  domClickHandlers = new Map()
   geoJsonSetStyleCalls = 0
   stubFetch()
 })
@@ -216,6 +273,142 @@ describe('LeafletFranceMap', () => {
     expect(fitBoundsSpy).toHaveBeenCalled()
   })
 
+  it('un second clic sur le département déjà zoomé ne fait rien (évite de dézoomer accidentellement en cliquant à côté d\'un point)', async () => {
+    mount(LeafletFranceMap)
+    await flushPromises()
+
+    const layer = makeLayer()
+    geoJsonOnEachFeature!(GEOJSON.features[0], layer)
+    layer.__handlers.click?.()
+    expect(fitBoundsSpy).toHaveBeenCalledTimes(1)
+
+    layer.__handlers.click?.()
+    expect(fitBoundsSpy).toHaveBeenCalledTimes(1) // pas de second appel
+  })
+
+  it("le bouton « étape précédente » revient en arrière une étape à la fois (ville -> département -> France)", async () => {
+    const wrapper = mount(LeafletFranceMap)
+    await flushPromises()
+
+    const deptLayer = makeLayer()
+    geoJsonOnEachFeature!(GEOJSON.features[0], deptLayer)
+    deptLayer.__handlers.click?.()
+    await flushPromises()
+
+    const communeMarker = pointsAdded[0] as ReturnType<typeof makeLayer>
+    communeMarker.__handlers.click?.()
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text()).toContain('Testville')
+
+    clickNav("Revenir à l'étape précédente")
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text()).toContain('Ain')
+    expect(wrapper.text()).not.toContain('Testville')
+
+    clickNav("Revenir à l'étape précédente")
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text()).not.toContain('Ain')
+    expect(wrapper.text()).not.toContain('Testville')
+  })
+
+  it("le bouton « étape précédente » est grisé tant qu'il n'y a rien avant, et inopérant dans cet état", async () => {
+    const wrapper = mount(LeafletFranceMap)
+    await flushPromises()
+
+    expect(navButton("Revenir à l'étape précédente").classList.contains('leaflet-disabled')).toBe(true)
+    clickNav("Revenir à l'étape précédente")
+    expect(setViewSpy).not.toHaveBeenCalled()
+
+    const deptLayer = makeLayer()
+    geoJsonOnEachFeature!(GEOJSON.features[0], deptLayer)
+    deptLayer.__handlers.click?.()
+    await wrapper.vm.$nextTick()
+    expect(navButton("Revenir à l'étape précédente").classList.contains('leaflet-disabled')).toBe(false)
+
+    clickNav("Revenir à l'étape précédente")
+    expect(navButton("Revenir à l'étape précédente").classList.contains('leaflet-disabled')).toBe(true)
+  })
+
+  it("le bouton « vue France » recadre sur la France entière et efface la sélection", async () => {
+    const wrapper = mount(LeafletFranceMap)
+    await flushPromises()
+
+    const deptLayer = makeLayer()
+    geoJsonOnEachFeature!(GEOJSON.features[0], deptLayer)
+    deptLayer.__handlers.click?.()
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text()).toContain('Ain')
+
+    // Le mock de la carte reste au zoom 6 (> zoom France + 0,5) : le bouton est donc actif.
+    const zoomend = mapOnSpy.mock.calls.find((c: unknown[]) => c[0] === 'zoomend')?.[1] as () => void
+    zoomend()
+    await wrapper.vm.$nextTick()
+    expect(navButton('Revenir à la vue France').classList.contains('leaflet-disabled')).toBe(false)
+
+    clickNav('Revenir à la vue France')
+    await wrapper.vm.$nextTick()
+    expect(setViewSpy).toHaveBeenLastCalledWith([46.6, 2.4], 5)
+    expect(wrapper.text()).not.toContain('Ain')
+  })
+
+  it("les points et l'anneau vivent dans leurs propres calques, au-dessus des départements (régression : le département survolé remontait par-dessus les points et les rendait incliquables)", async () => {
+    const { default: L } = await import('leaflet')
+    mount(LeafletFranceMap)
+    await flushPromises()
+
+    const deptLayer = makeLayer()
+    geoJsonOnEachFeature!(GEOJSON.features[0], deptLayer)
+    deptLayer.__handlers.click?.()
+    await flushPromises()
+
+    const calls = (L.circleMarker as ReturnType<typeof vi.fn>).mock.calls as [unknown, { pane?: string; radius: number }][]
+    const ring = calls.find((c) => c[1].radius === 16)
+    const points = calls.filter((c) => c[1].radius === 5)
+    expect(ring?.[1].pane).toBe('repere')
+    expect(points.length).toBeGreaterThan(0)
+    for (const p of points) expect(p[1].pane).toBe('etablissements')
+  })
+
+  it("l'anneau de repère n'est plus cliquable, n'a pas de remplissage et passe sous les points (il ne doit jamais gêner le clic sur un établissement qu'il entoure)", async () => {
+    const { default: L } = await import('leaflet')
+    mount(LeafletFranceMap)
+    await flushPromises()
+
+    const calls = (L.circleMarker as ReturnType<typeof vi.fn>).mock.calls as [unknown, { radius: number; fill?: boolean; interactive?: boolean }][]
+    const ring = calls.find((c) => c[1].radius === 16)
+    expect(ring?.[1].fill).toBe(false)
+    expect(ring?.[1].interactive).toBe(false)
+
+    const mapMock = (L.map as ReturnType<typeof vi.fn>).mock.results[0].value as { createPane: ReturnType<typeof vi.fn> }
+    const zIndexOf = (name: string) => {
+      const i = mapMock.createPane.mock.calls.findIndex((c) => c[0] === name)
+      return Number((mapMock.createPane.mock.results[i].value as HTMLElement).style.zIndex)
+    }
+    expect(zIndexOf('repere')).toBeLessThan(zIndexOf('etablissements'))
+  })
+
+  it("recliquer la commune déjà affichée n'ajoute pas d'étape : « précédent » ramène au département, pas sur la même fiche", async () => {
+    stubFetch(COMMUNE_PAYLOAD, { updatedAt: '2026-09-17T00:00:00Z', communes: {} })
+    const wrapper = mount(LeafletFranceMap)
+    await flushPromises()
+
+    const deptLayer = makeLayer()
+    geoJsonOnEachFeature!(GEOJSON.features[0], deptLayer)
+    deptLayer.__handlers.click?.()
+    await flushPromises()
+
+    const communeMarker = pointsAdded[0] as ReturnType<typeof makeLayer>
+    communeMarker.__handlers.click?.()
+    communeMarker.__handlers.click?.()
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text()).toContain('Testville')
+
+    clickNav("Revenir à l'étape précédente")
+    await wrapper.vm.$nextTick()
+    expect(wrapper.text()).not.toContain('Testville')
+    expect(wrapper.text()).toContain('Ain')
+  })
+
   it('les établissements sont désactivés par défaut', async () => {
     const { default: L } = await import('leaflet')
     mount(LeafletFranceMap)
@@ -256,10 +449,61 @@ describe('LeafletFranceMap', () => {
     expect(wrapper.text()).toContain('Ain')
   })
 
-  it("sans département zoomé, aucun point ne s'affiche (des milliers de communes nationales feraient une masse illisible)", async () => {
+  it("vue France : un petit point non cliquable par commune, sur un calque canevas à part (régression : rien ne s'affichait sans département zoomé)", async () => {
+    const { default: L } = await import('leaflet')
     mount(LeafletFranceMap)
     await flushPromises()
-    expect(pointsAdded).toHaveLength(0)
+
+    expect(pointsAdded.length).toBeGreaterThan(0)
+    const calls = (L.circleMarker as ReturnType<typeof vi.fn>).mock.calls as [
+      unknown,
+      { radius: number; pane?: string; interactive?: boolean; renderer?: unknown },
+    ][]
+    const dots = calls.filter((c) => c[1].pane === 'communes-france')
+    expect(dots.length).toBe(pointsAdded.length)
+    for (const [, options] of dots) {
+      expect(options.interactive).toBe(false) // ne bloque pas le clic sur les départements
+      expect(options.radius).toBeLessThan(5) // plus petits que les points d'un département zoomé
+      expect(options.renderer).toBeDefined() // canevas : 16 000 éléments SVG ralentiraient la carte
+    }
+    const mapMock = (L.map as ReturnType<typeof vi.fn>).mock.results[0].value as { createPane: ReturnType<typeof vi.fn> }
+    const i = mapMock.createPane.mock.calls.findIndex((c) => c[0] === 'communes-france')
+    expect((mapMock.createPane.mock.results[i].value as HTMLElement).style.pointerEvents).toBe('none')
+  })
+
+  it("la taille des points de la vue France suit le zoom", async () => {
+    const { default: L } = await import('leaflet')
+    mount(LeafletFranceMap)
+    await flushPromises()
+
+    const mapMock = (L.map as ReturnType<typeof vi.fn>).mock.results[0].value as { getZoom: ReturnType<typeof vi.fn> }
+    const zoomend = mapOnSpy.mock.calls.find((c: unknown[]) => c[0] === 'zoomend')?.[1] as () => void
+    const radiusAt = (zoom: number) => {
+      mapMock.getZoom.mockReturnValue(zoom)
+      zoomend()
+      const calls = (L.circleMarker as ReturnType<typeof vi.fn>).mock.calls as [unknown, { radius: number; pane?: string }][]
+      return calls.filter((c) => c[1].pane === 'communes-france').at(-1)![1].radius
+    }
+    const small = radiusAt(5)
+    const large = radiusAt(8)
+    expect(large).toBeGreaterThan(small)
+  })
+
+  it("en zoomant un département, les petits points de la vue France cèdent la place aux points communes/établissements", async () => {
+    const { default: L } = await import('leaflet')
+    mount(LeafletFranceMap)
+    await flushPromises()
+
+    const deptLayer = makeLayer()
+    geoJsonOnEachFeature!(GEOJSON.features[0], deptLayer)
+    deptLayer.__handlers.click?.()
+    await flushPromises()
+
+    const calls = (L.circleMarker as ReturnType<typeof vi.fn>).mock.calls as [unknown, { pane?: string }][]
+    const lastPane = calls.at(-1)![1].pane
+    expect(lastPane).toBe('etablissements')
+    for (const marker of pointsAdded) expect(marker).toBeDefined()
+    expect(pointsAdded).toHaveLength(2) // CH Grandville + point commune, comme avant
   })
 
   it('le clic sur un point commune affiche son détail et zoome sur la ville (pas au survol)', async () => {
@@ -312,7 +556,6 @@ describe('LeafletFranceMap', () => {
   it('un établissement géocodé obtient son propre point à sa vraie adresse, distinct du point commune', async () => {
     mount(LeafletFranceMap)
     await flushPromises()
-    expect(pointsAdded).toHaveLength(0) // avant le zoom département : aucun point
 
     // Clic département -> zoomedDept = '01' -> charge etablissements/01.json -> refreshData
     const layer = makeLayer()
@@ -348,6 +591,23 @@ describe('LeafletFranceMap', () => {
     expect(wrapper.text()).toContain('Dupont')
     // Zoom "rue" (17) sur ses vraies coordonnées, pas le zoom "ville" sur la commune
     expect(setViewSpy).toHaveBeenCalledWith([45.531, 4.276], 17)
+  })
+
+  it("chaque praticien listé mène à SA fiche (lien vers /praticien/<identifiant national> dans un nouvel onglet)", async () => {
+    const wrapper = mount(LeafletFranceMap)
+    await flushPromises()
+
+    const deptLayer = makeLayer()
+    geoJsonOnEachFeature!(GEOJSON.features[0], deptLayer)
+    deptLayer.__handlers.click?.()
+    await flushPromises()
+
+    ;(pointsAdded[0] as ReturnType<typeof makeLayer>).__handlers.click?.()
+    await wrapper.vm.$nextTick()
+
+    const links = wrapper.findAll('a.detail-card__fiche')
+    expect(links.map((l) => l.attributes('href'))).toEqual(['/praticien/810000000101', '/praticien/810000000102'])
+    expect(links.every((l) => l.attributes('target') === '_blank')).toBe(true)
   })
 
   it('cliquer le point commune liste seulement les établissements NON géocodés (les autres ont déjà leur propre point)', async () => {
@@ -418,5 +678,290 @@ describe('LeafletFranceMap', () => {
     expect(wrapper.text()).toContain('Martin')
     expect(wrapper.text()).not.toContain('Jean') // le médecin de CH Grandville, filtré
     expect(wrapper.text()).not.toContain('Poulteau')
+  })
+
+  describe('spécialités, densité et « autour de moi »', () => {
+    it('n\'offre le choix de spécialité qu\'aux professions qui en ont', async () => {
+      stubFetch(COMMUNE_PAYLOAD, ETABLISSEMENTS_01, DEPT_PAYLOAD_SPECIALITES)
+      const wrapper = mount(LeafletFranceMap)
+      await flushPromises()
+      expect(wrapper.findAll('select')).toHaveLength(1) // « Toutes les professions » : pas de spécialité
+
+      await wrapper.find('select').setValue('Médecin')
+      const selects = wrapper.findAll('select')
+      expect(selects).toHaveLength(2)
+      expect(selects[1]!.text()).toContain('Cardiologie (2)')
+
+      await wrapper.find('select').setValue('Infirmier') // aucune spécialité pour les infirmiers de ce jeu
+      expect(wrapper.findAll('select')).toHaveLength(1)
+    })
+
+    it('choisir une spécialité recolore la carte en place et affiche ses points communes', async () => {
+      stubFetch(COMMUNE_PAYLOAD, ETABLISSEMENTS_01, DEPT_PAYLOAD_SPECIALITES)
+      const { default: L } = await import('leaflet')
+      const wrapper = mount(LeafletFranceMap)
+      await flushPromises()
+      await wrapper.find('select').setValue('Médecin')
+      await flushPromises()
+      const avant = geoJsonSetStyleCalls
+
+      await wrapper.findAll('select')[1]!.setValue('Cardiologie')
+      await flushPromises()
+
+      expect(geoJsonSetStyleCalls).toBeGreaterThan(avant)
+      expect((L.map as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1) // la carte n'est jamais recréée
+      expect(wrapper.text().replace(/\u00a0/g, ' ')).toContain('Cardiologie pour 100 000 habitants')
+    })
+
+    it('colore par densité par défaut ; la bascule recolore en place et change la légende', async () => {
+      stubFetch(COMMUNE_PAYLOAD, ETABLISSEMENTS_01, DEPT_PAYLOAD_SPECIALITES)
+      const wrapper = mount(LeafletFranceMap)
+      await flushPromises()
+      expect(wrapper.text().replace(/\u00a0/g, ' ')).toContain('Praticiens pour 100 000 habitants')
+      // 5 praticiens / 100 000 habitants -> légende maximale à 5 (pas 5 000)
+      expect(wrapper.find('.color-legend__ticks').text().replace(/\s/g, '')).toBe('05')
+
+      const avant = geoJsonSetStyleCalls
+      await wrapper.find('input[type="checkbox"]').setValue(false)
+      await flushPromises()
+      expect(geoJsonSetStyleCalls).toBeGreaterThan(avant)
+      expect(wrapper.text()).toContain('Praticiens par département')
+    })
+
+    it('la fiche d\'un département indique l\'effectif ET la densité, quel que soit le mode', async () => {
+      const wrapper = mount(LeafletFranceMap)
+      await flushPromises()
+      const layer = makeLayer()
+      geoJsonOnEachFeature!(GEOJSON.features[0], layer)
+      layer.__handlers.click?.()
+      await flushPromises()
+
+      const carte = wrapper.find('.detail-card').text().replace(/\s+/g, ' ')
+      expect(carte).toContain('Ain')
+      expect(carte).toContain('5 praticiens')
+      expect(carte).toContain('5 pour 100 000 hab.')
+    })
+
+    describe('« Autour de moi »', () => {
+      const positionne = (impl: (ok: (p: unknown) => void, err: (e: unknown) => void) => void) =>
+        Object.defineProperty(navigator, 'geolocation', { value: { getCurrentPosition: vi.fn(impl) }, configurable: true })
+      const bouton = (wrapper: ReturnType<typeof mount>) => wrapper.findAll('button').find((b) => b.text().includes('Autour de moi'))!
+
+      it('localise, liste les établissements les plus proches et les place sur la carte', async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01 } }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+
+        // CH Grandville (géocodé à 190 km) est trop loin ; le cabinet sans adresse géocodée est au centre de Testville
+        const panneau = wrapper.find('.nearby')
+        expect(panneau.text()).toContain('Cabinet Poulteau')
+        expect(panneau.text()).toContain('Testville')
+        expect(panneau.text()).toContain('≈')
+        expect(panneau.text()).not.toContain('CH Grandville')
+        expect(nearbyAdded).toHaveLength(2) // vous + le cabinet
+        expect(fitBoundsSpy).toHaveBeenCalled()
+      })
+
+      it("position imprécise (localisation par IP) : prévient et trace la zone d'incertitude sur la carte", async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01, accuracy: 45_000 } }))
+        const { default: L } = await import('leaflet')
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+
+        expect(wrapper.find('.nearby__warning').text()).toContain('Position approximative (à 45 km près)')
+        expect(L.circle).toHaveBeenCalledWith([45.0, 2.01], expect.objectContaining({ radius: 45_000, interactive: false }))
+        expect(nearbyAdded).toHaveLength(3) // zone d'incertitude + vous + le cabinet
+        // Le cadrage englobe toute la zone d'incertitude (~45 km autour), pas seulement les résultats.
+        const cadre = fitBoundsSpy.mock.calls.at(-1)![0] as [number, number][]
+        const latitudes = cadre.map((p) => p[0])
+        expect(Math.max(...latitudes) - Math.min(...latitudes)).toBeGreaterThan(0.7)
+      })
+
+      it("position imprécise : choisir une ville relance la recherche autour d'elle, sans l'avertissement", async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01, accuracy: 45_000 } }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+        expect(wrapper.find('.nearby__warning').exists()).toBe(true)
+
+        await wrapper.find('.city-search input').setValue('Testv')
+        await wrapper.find('.city-search__suggestions button').trigger('mousedown')
+        await flushPromises()
+
+        expect(wrapper.find('.nearby').text()).toContain('Autour de Testville')
+        expect(wrapper.find('.nearby__warning').exists()).toBe(false)
+      })
+
+      it("position précise (GPS) : pas d'avertissement ni de cercle d'incertitude", async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01, accuracy: 20 } }))
+        const { default: L } = await import('leaflet')
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+
+        expect(wrapper.find('.nearby__warning').exists()).toBe(false)
+        expect(L.circle).not.toHaveBeenCalled()
+      })
+
+      it("choisir une ville à la place ne garde pas l'avertissement de la position imprécise", async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01, accuracy: 45_000 } }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+        expect(wrapper.find('.nearby__warning').exists()).toBe(true)
+
+        await wrapper.find('.nearby__close').trigger('click')
+        expect(wrapper.find('.nearby').exists()).toBe(false)
+        positionne((_ok, err) => err({ code: 2 }))
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+        await wrapper.find('.city-search input').setValue('Testv')
+        await wrapper.find('.city-search__suggestions button').trigger('mousedown')
+        await flushPromises()
+        expect(wrapper.find('.nearby').text()).toContain('Autour de Testville')
+        expect(wrapper.find('.nearby__warning').exists()).toBe(false)
+      })
+
+      it('choisir un résultat affiche ses praticiens', async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01 } }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+
+        await wrapper.find('.nearby__item').trigger('click')
+        expect(wrapper.find('.detail-card').text()).toContain('Sylvain Poulteau')
+      })
+
+      it('suit la profession choisie : relance la recherche depuis la même position', async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01 } }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+        expect(wrapper.find('.nearby').text()).toContain('Cabinet Poulteau')
+
+        await wrapper.find('select').setValue('Infirmier') // le cabinet n'a qu'un médecin
+        await flushPromises()
+        expect(wrapper.find('.nearby').text()).not.toContain('Cabinet Poulteau')
+        expect(wrapper.find('.nearby').text()).toContain('Aucun établissement « Infirmier »')
+        expect(navigator.geolocation.getCurrentPosition).toHaveBeenCalledTimes(1) // pas de nouvelle demande de position
+      })
+
+      it('explique un refus de localisation', async () => {
+        positionne((_ok, err) => err({ code: 1, PERMISSION_DENIED: 1 }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+        expect(wrapper.find('.nearby').text()).toContain('Position refusée')
+      })
+
+      it('signale un navigateur sans géolocalisation', async () => {
+        Reflect.deleteProperty(navigator, 'geolocation')
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        expect(wrapper.find('.nearby').text()).toContain('La localisation n\'est pas disponible ici')
+      })
+
+      it('signale un site ouvert sans https, où les navigateurs refusent la localisation', async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01 } }))
+        Object.defineProperty(window, 'isSecureContext', { value: false, configurable: true })
+        try {
+          const wrapper = mount(LeafletFranceMap)
+          await flushPromises()
+          await bouton(wrapper).trigger('click')
+          expect(wrapper.find('.nearby').text()).toContain('sans https')
+          expect(navigator.geolocation.getCurrentPosition).not.toHaveBeenCalled()
+        } finally {
+          Reflect.deleteProperty(window, 'isSecureContext')
+        }
+      })
+
+      it("distingue un appareil qui n'arrive pas à se localiser d'un délai dépassé", async () => {
+        positionne((_ok, err) => err({ code: 2 }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+        expect(wrapper.find('.nearby').text()).toContain("n'arrive pas à déterminer sa position")
+
+        positionne((_ok, err) => err({ code: 3 }))
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+        expect(wrapper.find('.nearby').text()).toContain('a pris trop de temps')
+      })
+
+      it("laisse plus de temps à la localisation qu'avant (10 s ne suffisaient pas toujours)", async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01 } }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        const options = (navigator.geolocation.getCurrentPosition as ReturnType<typeof vi.fn>).mock.calls[0]![2] as { timeout: number }
+        expect(options.timeout).toBeGreaterThanOrEqual(20_000)
+      })
+
+      it("un échec de la recherche (et non de la localisation) ne prétend pas que la position est introuvable", async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01 } }))
+        stubFetch(COMMUNE_PAYLOAD, { updatedAt: '2026-09-17T00:00:00Z', communes: {} })
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('réseau'))))
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+        expect(wrapper.find('.nearby').text()).toContain('La recherche des établissements a échoué')
+        expect(wrapper.find('.nearby').text()).not.toContain('localiser')
+        vi.unstubAllGlobals()
+      })
+
+      it("localisation impossible : choisir une ville lance la recherche autour d'elle, et le panneau le dit", async () => {
+        positionne((_ok, err) => err({ code: 2 }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+        expect(wrapper.find('.nearby').text()).toContain('choisissez une ville')
+
+        const input = wrapper.find('input[type="search"]')
+        await input.setValue('Testv')
+        await wrapper.find('.city-search__suggestions button').trigger('mousedown')
+        await flushPromises()
+
+        const panneau = wrapper.find('.nearby')
+        expect(panneau.text()).toContain('Autour de Testville')
+        expect(panneau.text()).toContain('Cabinet Poulteau')
+        expect(navigator.geolocation.getCurrentPosition).toHaveBeenCalledTimes(1) // pas de nouvelle demande de position
+      })
+
+      it("sans échec de localisation, choisir une ville ne lance pas de recherche « autour de moi »", async () => {
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await wrapper.find('input[type="search"]').setValue('Testv')
+        await wrapper.find('.city-search__suggestions button').trigger('mousedown')
+        await flushPromises()
+        expect(wrapper.find('.nearby').exists()).toBe(false)
+      })
+
+      it('se ferme avec le bouton retour : liste et marqueurs disparaissent', async () => {
+        positionne((ok) => ok({ coords: { latitude: 45.0, longitude: 2.01 } }))
+        const wrapper = mount(LeafletFranceMap)
+        await flushPromises()
+        await bouton(wrapper).trigger('click')
+        await flushPromises()
+
+        await wrapper.find('.nearby__close').trigger('click')
+        expect(wrapper.find('.nearby').exists()).toBe(false)
+        expect(nearbyAdded).toHaveLength(0)
+      })
+    })
   })
 })
