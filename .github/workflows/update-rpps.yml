@@ -15,6 +15,8 @@ jobs:
       actions: write # lancer la CI sur la branche (voir plus bas)
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: dev # le chemin commun feature → dev → staging → main (R45) : les données passent par dev
 
       - uses: actions/setup-python@v5
         with:
@@ -32,9 +34,10 @@ jobs:
       - name: Update RPPS data (réintègre les coordonnées fraîchement géocodées)
         run: python scripts/update_rpps.py --offline
 
-      # main est protégée (fusion uniquement, pas de push direct, voir les règles de
+      # dev est protégée (fusion uniquement, pas de push direct, voir les règles de
       # branche) -> on passe par une branche dédiée + PR avec fusion automatique dès
       # que la CI (lint/test/build) passe, plutôt qu'un push direct qui échouerait.
+      # Les données arrivent ensuite en production par les promotions dev → staging → main.
       - name: Commit if changed
         id: commit
         run: |
@@ -55,7 +58,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr create --base main --head automated/rpps-data-update \
+          gh pr create --base dev --head automated/rpps-data-update \
             --title "chore: mise à jour quotidienne des données RPPS" \
             --body "Régénéré automatiquement par .github/workflows/update-rpps.yml." \
             || echo "PR déjà ouverte, réutilisation"
