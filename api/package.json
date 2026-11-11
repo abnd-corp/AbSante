@@ -24,7 +24,7 @@
     "pg-copy-streams": "^7.0.0"
   },
   "devDependencies": {
-    "@types/node": "^24.13.5",
+    "@types/node": "^26.6.5",
     "@types/pg": "^8.23.1",
     "@types/pg-copy-streams": "^1.2.5",
     "@vitest/coverage-v8": "4.1.10",
